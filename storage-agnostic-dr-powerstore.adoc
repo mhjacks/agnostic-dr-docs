@@ -1,0 +1,573 @@
+= Configuring storage-agnostic disaster recovery for OpenShift workloads [Technology Preview]
+:toc: left
+:toclevels: 3
+:icons:
+:doctype: book
+
+This guide describes how to configure storage-agnostic disaster recovery (DR) for stateful OpenShift workloads by using the CSI-Addons VolumeGroupReplication APIs. The Technology Preview scope is Dell PowerStore block storage in asynchronous (Async) mode.
+
+[IMPORTANT]
+====
+This feature is a *Technology Preview* and is not supported for production use. The initial scope is limited to:
+
+* Dell PowerStore block volumes.
+* Asynchronous replication with a non-zero recovery point objective (RPO).
+* Two managed OpenShift clusters and one Red Hat Advanced Cluster Management (RHACM) hub cluster.
+* Only `VolumeGroupReplicationClass` is supported for Dell PowerStore; `VolumeReplicationClass` has a known issue.
+
+It does not include PowerStore Metro or synchronous replication, Dell CSM-DR, or `DellCSIReplicationGroup` workflows.
+====
+
+[NOTE]
+====
+Dell's public CSM documentation provides general PowerStore CSI driver installation and array replication concepts, but it might not yet document this storage-agnostic DR integration. This guide uses Dell-supported driver parameters and public CSI-Addons and Ramen APIs. Where Dell documentation is available, it is referenced directly.
+====
+
+== Understanding the solution
+
+Storage-agnostic DR separates OpenShift DR orchestration from a specific storage backend. The storage CSI driver implements the CSI-Addons replication and volume-group APIs, and OpenShift DR uses those APIs to protect, promote, demote, and resynchronize groups of PersistentVolumeClaims (PVCs).
+
+The PowerStore implementation uses the following components:
+
+* *Red Hat Advanced Cluster Management (RHACM):* manages the hub and the two managed OpenShift clusters.
+* *OpenShift DR / Ramen:* creates and manages `DRPolicy`, `DRPlacementControl`, and `VolumeReplicationGroup` resources.
+* *CSI-Addons controller:* provides the cluster-side `VolumeGroupReplicationClass`, `VolumeGroupReplication`, and `VolumeGroupReplicationContent` APIs.
+* *Dell CSI Driver for PowerStore 1.19.0 or later:* exposes PowerStore volume and volume-group replication operations through CSI-Addons.
+* *PowerStore remote systems and replication sessions:* replicate a PowerStore volume group from the source array to the target array.
+
+=== Deployment topology
+
+Use one hub cluster and two managed clusters:
+
+....
+                +------------------------+
+                |       RHACM hub        |
+                |  OpenShift DR / Ramen  |
+                +-----------+------------+
+                            |
+              +-------------+-------------+
+              |                           |
+   +----------v----------+     +----------v----------+
+   |  Managed cluster A  |     |  Managed cluster B  |
+   |  PowerStore CSI     |     |  PowerStore CSI     |
+   |  CSI-Addons         |     |  CSI-Addons         |
+   +----------+----------+     +----------+----------+
+              |                           |
+      +-------v-------+         +-------v-------+
+      | PowerStore A  | <-----> | PowerStore B  |
+      | source group  |  async  | replica group |
+      +---------------+         +---------------+
+....
+
+=== What OpenShift DR creates
+
+Do not create `VolumeGroupReplication` or `VolumeGroupReplicationContent` resources manually. After you create a `DRPlacementControl`, Ramen:
+
+. Selects PVCs by using the DRPC `pvcSelector`.
+. Selects the matching `VolumeGroupReplicationClass` by using the storage class provisioner, labels, and `schedulingInterval`.
+. Labels the selected PVCs with `ramendr.openshift.io/consistency-group`.
+. Creates a `VolumeGroupReplication` resource in the application namespace.
+. Directs the CSI-Addons controller and PowerStore CSI driver to create the PowerStore volume group, protection policy, replication rule, and replication session.
+. Changes the replication state during failover and relocation.
+
+You are responsible for creating and labeling the storage class and the replication class. Ramen owns the resulting group resources.
+
+== Prerequisites
+
+* Install and configure an RHACM hub cluster that manages two OpenShift Container Platform clusters.
+* Install the ODF DR orchestrator and the ODF CSI-Addons operator. Do not install the ODF storage stack, a `StorageCluster`, or Ceph.
+* Install the Dell CSI Driver for PowerStore version 1.19.0 or later on both managed clusters.
+* Configure both PowerStore arrays as remote systems of each other.
+* Verify that the PowerStore management and replication networks are healthy and that the remote-system data connection state is `Complete`.
+* Verify that all worker nodes that run protected workloads have the required PowerStore FC, iSCSI, or NVMe/TCP connectivity.
+* Plan an asynchronous RPO. This guide uses a five-minute RPO.
+* Provide an S3-compatible object store for Ramen metadata, and configure the required S3 profile. See the Red Hat DR guide for the object-store and GitOps setup.
+
+[IMPORTANT]
+====
+Do not enable Dell CSM-DR and CSI-Addons replication for the same PowerStore CSI driver. They manage different replication APIs and can conflict.
+====
+
+== Preparing PowerStore
+
+Perform these steps in PowerStore Manager, or by using your PowerStore automation tooling.
+
+. On PowerStore A, add PowerStore B as a remote system.
+. On PowerStore B, add PowerStore A as a remote system.
+. Verify that both remote systems are reachable and that the data connection state is healthy.
+. Record the following values for each array:
+** *Name:* the remote-system name displayed in PowerStore Manager.
+** *Global ID:* the PowerStore global ID configured in the CSI driver array secret.
+. Select an asynchronous RPO. For a five-minute policy, use:
+** `schedulingInterval: 5m` in the OpenShift DR resources.
+** `replication.storage.dell.com/rpo: Five_Minutes` in the PowerStore replication class.
+
+[NOTE]
+====
+The driver creates the PowerStore volume group, protection policy, and replication rule when the `VolumeGroupReplication` resource is reconciled. You do not need to pre-create a protection policy for this workflow.
+====
+
+Supported PowerStore asynchronous RPO values include `Five_Minutes`, `Fifteen_Minutes`, `Thirty_Minutes`, `One_Hour`, `Six_Hours`, `Twelve_Hours`, and `One_Day`. `Zero` is used only for synchronous replication and is outside the Technology Preview scope.
+
+[IMPORTANT]
+====
+The first synchronization of a newly protected volume group can exceed the configured RPO because of the way PowerStore implements asynchronous replication. Subsequent synchronization cycles are governed by the configured RPO. Monitor the initial synchronization to completion before using the RPO to estimate potential data loss.
+====
+
+== Installing PowerStore CSI and enabling CSI-Addons replication
+
+Install the Dell CSI Driver for PowerStore 1.19.0 or later on both managed clusters by following link:https://dell.github.io/csm-docs/docs/getting-started/installation/openshift/powerstore/csmoperator/[Dell's OpenShift PowerStore CSI Operator installation guide].
+
+When you install or update the Dell `ContainerStorageModule` custom resource, explicitly disable legacy CSM-DR and enable CSI-Addons replication:
+
+[source,yaml]
+----
+apiVersion: storage.dell.com/v1
+kind: ContainerStorageModule
+metadata:
+  name: powerstore
+  namespace: powerstore
+spec:
+  version: v1.19.0
+  driver:
+    csiDriverType: powerstore
+    controller:
+      envs:
+        - name: X_CSM_DR_ENABLED
+          value: "false"
+        - name: X_CSI_CSIADDONS_REPLICATION_ENABLED
+          value: "true"
+----
+
+Apply the same configuration on both managed clusters. If you install with Helm instead of the Dell CSM Operator, set the equivalent environment variables in the driver controller deployment.
+
+Verify that the driver and injected `csi-addons` sidecar are running:
+
+[source,shell]
+----
+oc --context <managed-cluster-a> -n powerstore get pods
+oc --context <managed-cluster-b> -n powerstore get pods
+----
+
+Each controller pod must include a ready `csi-addons` container.
+
+== Installing the ODF CSI-Addons operator
+
+Install the ODF CSI-Addons operator on both managed clusters by using the supported OperatorHub subscription. This operator installs the CSI-Addons controller and the required custom resource definitions.
+
+[NOTE]
+====
+The `openshift-storage` namespace is required by the operator. Creating the subscription does not install an ODF `StorageCluster` or the ODF storage stack.
+====
+
+[source,yaml]
+----
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: odf-csi-addons-operator
+  namespace: openshift-storage
+spec:
+  channel: stable-4.22
+  installPlanApproval: Automatic
+  name: odf-csi-addons-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  startingCSV: odf-csi-addons-operator.v4.22.7-rhodf
+----
+
+Apply the subscription on managed cluster A and managed cluster B.
+
+Verify the installation:
+
+[source,shell]
+----
+oc --context <managed-cluster-a> -n openshift-storage get subscription odf-csi-addons-operator
+oc --context <managed-cluster-b> -n openshift-storage get subscription odf-csi-addons-operator
+
+oc --context <managed-cluster-a> -n openshift-storage get csv | grep odf-csi-addons-operator
+oc --context <managed-cluster-b> -n openshift-storage get csv | grep odf-csi-addons-operator
+
+oc --context <managed-cluster-a> -n openshift-storage get deploy | grep csi-addons
+oc --context <managed-cluster-b> -n openshift-storage get deploy | grep csi-addons
+
+oc --context <managed-cluster-a> get crd \
+  volumegroupreplicationclasses.replication.storage.openshift.io
+oc --context <managed-cluster-b> get crd \
+  volumegroupreplicationclasses.replication.storage.openshift.io
+----
+
+[IMPORTANT]
+====
+Do not install the upstream `kubernetes-csi-addons` manifests directly. Use the ODF CSI-Addons operator subscription shown above.
+====
+
+== Creating and installing the VolumeGroupReplicationClass
+
+The `VolumeGroupReplicationClass` is cluster-scoped and must be installed on both managed clusters. Use the same class name and group replication ID on both clusters, but reverse the local and remote PowerStore values.
+
+=== Values used in the examples
+
+[cols="1,1,1"]
+|===
+|Value |Managed cluster A |Managed cluster B
+
+|PowerStore global ID
+|`<powerstore-a-global-id>`
+|`<powerstore-b-global-id>`
+
+|Remote PowerStore global ID
+|`<powerstore-b-global-id>`
+|`<powerstore-a-global-id>`
+
+|Remote system name
+|`<powerstore-b-name>`
+|`<powerstore-a-name>`
+
+|Local storage ID label
+|`powerstore-a`
+|`powerstore-b`
+|===
+
+Use a stable value for `ramendr.openshift.io/storageid` that identifies the local storage backend. The array global ID is a good choice. Use the same `groupreplicationid` value on both clusters so Ramen can identify the peer relationship.
+
+=== Labeling the PowerStore storage class
+
+Create or update the PowerStore block storage class on both managed clusters. Use the same storage-class name on both clusters, but set each cluster's local storage ID label.
+
+The following example is for managed cluster A:
+
+[source,yaml]
+----
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: powerstore-block
+  labels:
+    ramendr.openshift.io/storageid: powerstore-a
+    ramendr.openshift.io/groupreplicationid: powerstore-async
+provisioner: csi-powerstore.dellemc.com
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  arrayID: <powerstore-a-global-id>
+  csi.storage.k8s.io/fstype: xfs
+----
+
+On managed cluster B, create the same storage-class name and parameters, but use:
+
+* `ramendr.openshift.io/storageid: powerstore-b`
+* `arrayID: <powerstore-b-global-id>`
+
+[NOTE]
+====
+Dell PowerStore CSI supports both `xfs` and `ext4` for block volumes. Dell uses `ext4` as its default, but `xfs` is shown here because it is the common Red Hat choice for large block volumes. Use the filesystem type required by your application and existing storage classes.
+====
+
+[IMPORTANT]
+====
+Do not use the `replication.storage.dell.com/isReplicationEnabled`, `remoteStorageClassName`, or `remoteClusterID` storage-class parameters from Dell CSM-DR. Storage-agnostic DR uses a normal PowerStore storage class and carries replication settings in the CSI-Addons replication class.
+====
+
+[IMPORTANT]
+====
+Do not use `VolumeReplicationClass` with Dell PowerStore in this Technology Preview. There is a known issue with the Dell per-volume replication path. Use `VolumeGroupReplicationClass` instead.
+====
+
+=== Creating the VolumeGroupReplicationClass
+
+The `VolumeGroupReplicationClass` configures PowerStore group replication. Create the following object on managed cluster A:
+
+[source,yaml]
+----
+apiVersion: replication.storage.openshift.io/v1alpha1
+kind: VolumeGroupReplicationClass
+metadata:
+  name: powerstore-async-vgrc
+  labels:
+    ramendr.openshift.io/replication-class: powerstore-async
+    ramendr.openshift.io/storageid: powerstore-a
+    ramendr.openshift.io/groupreplicationid: powerstore-async
+  annotations:
+    replication.storage.openshift.io/is-default-class: "true"
+spec:
+  provisioner: csi-powerstore.dellemc.com
+  parameters:
+    schedulingInterval: 5m
+    replication.storage.dell.com/sourceArray: <powerstore-a-global-id>
+    replication.storage.dell.com/targetArray: <powerstore-b-global-id>
+    replication.storage.dell.com/remoteSystem: <powerstore-b-name>
+    replication.storage.dell.com/replicationMode: ASYNC
+    replication.storage.dell.com/rpo: Five_Minutes
+    replication.storage.dell.com/volumeGroupPrefix: powerstore-dr
+----
+
+On managed cluster B, create the same object with these changes:
+
+* `ramendr.openshift.io/storageid: powerstore-b`
+* `replication.storage.dell.com/sourceArray: <powerstore-b-global-id>`
+* `replication.storage.dell.com/targetArray: <powerstore-a-global-id>`
+* `replication.storage.dell.com/remoteSystem: <powerstore-a-name>`
+
+Keep the class name, `groupreplicationid`, `schedulingInterval`, RPO, and mode the same.
+
+[NOTE]
+====
+`VolumeGroupReplicationClass.spec.provisioner` and `.spec.parameters` are immutable. To change the RPO, remote system, or scheduling interval, create a new class and update the storage-class labels and DR policy as needed.
+====
+
+=== Applying the class
+
+Save the manifests as, for example, `cluster-a-vgrc.yaml` and `cluster-b-vgrc.yaml`, and apply them:
+
+[source,shell]
+----
+oc --context <managed-cluster-a> apply -f cluster-a-vgrc.yaml
+oc --context <managed-cluster-b> apply -f cluster-b-vgrc.yaml
+----
+
+Verify the class on both clusters:
+
+[source,shell]
+----
+oc --context <managed-cluster-a> get volumegroupreplicationclasses
+
+oc --context <managed-cluster-b> get volumegroupreplicationclasses
+----
+
+Expected output on each cluster:
+
+[source,text]
+----
+NAME                    PROVISIONER                  AGE
+powerstore-async-vgrc   csi-powerstore.dellemc.com   2m
+----
+
+=== Class parameter reference
+
+[cols="2,3"]
+|===
+|Parameter |Description
+
+|`schedulingInterval`
+|Must exactly match `DRPolicy.spec.schedulingInterval`. Ramen uses this value to select a matching class. The examples use `5m`.
+
+|`replication.storage.dell.com/replicationMode`
+|Must be `ASYNC` in this Technology Preview.
+
+|`replication.storage.dell.com/rpo`
+|PowerStore asynchronous RPO. For a five-minute schedule, use `Five_Minutes`. It must be non-zero for Async mode.
+
+|`replication.storage.dell.com/remoteSystem`
+|Name of the remote PowerStore system as configured in PowerStore Manager.
+
+|`replication.storage.dell.com/sourceArray`
+|Global ID of the local PowerStore array. On each cluster, this is the array that serves the local PVCs.
+
+|`replication.storage.dell.com/targetArray`
+|Global ID of the peer PowerStore array. Reverse this value on the peer cluster.
+
+|`replication.storage.dell.com/volumeGroupPrefix`
+|Optional prefix for PowerStore volume-group names. The default driver prefix is `vg`.
+|===
+
+== Creating a DR policy
+
+On the hub cluster, create a `DRPolicy` whose scheduling interval matches the replication class:
+
+[source,yaml]
+----
+apiVersion: ramendr.openshift.io/v1alpha1
+kind: DRPolicy
+metadata:
+  name: powerstore-async-policy
+spec:
+  drClusters:
+    - <managed-cluster-a>
+    - <managed-cluster-b>
+  schedulingInterval: 5m
+  replicationClassSelector:
+    matchLabels:
+      ramendr.openshift.io/replication-class: powerstore-async
+----
+
+Verify the policy:
+
+[source,shell]
+----
+oc --context <hub-cluster> get drpolicy powerstore-async-policy -o yaml
+----
+
+Wait for a `Validated` condition with status `True`.
+
+== Protecting an application
+
+. Deploy the application on managed cluster A by using an RHACM Placement or a GitOps ApplicationSet.
+. Ensure every PVC that must be replicated:
+** Uses the `powerstore-block` storage class.
+** Has a label that matches the DRPC `pvcSelector`, for example `app: my-app`.
+** Uses a supported PowerStore block volume.
+. Create the DRPC on the hub cluster:
+
+[source,yaml]
+----
+apiVersion: ramendr.openshift.io/v1alpha1
+kind: DRPlacementControl
+metadata:
+  name: my-app-drpc
+  namespace: <application-namespace>
+spec:
+  preferredCluster: <managed-cluster-a>
+  drPolicyRef:
+    name: powerstore-async-policy
+  placementRef:
+    kind: Placement
+    name: <placement-name>
+  pvcSelector:
+    matchLabels:
+      app: my-app
+  action: Relocate
+----
+
+Monitor the DRPC:
+
+[source,shell]
+----
+oc --context <hub-cluster> -n <application-namespace> get drpc my-app-drpc -w
+oc --context <hub-cluster> -n <application-namespace> describe drpc my-app-drpc
+----
+
+== Verifying PowerStore group replication
+
+After the DRPC reaches a deployed state, verify the Kubernetes resources on managed cluster A:
+
+[source,shell]
+----
+oc --context <managed-cluster-a> -n <application-namespace> get pvc \
+  -l ramendr.openshift.io/consistency-group
+
+oc --context <managed-cluster-a> -n <application-namespace> get vgr
+oc --context <managed-cluster-a> -n <application-namespace> describe vgr <vgr-name>
+oc --context <managed-cluster-a> get volumegroupreplicationcontents
+----
+
+The `VolumeGroupReplication` current state must be `primary`. Its status must list all expected PVCs, and the condition must report that data is ready.
+
+Verify the PowerStore replication session in PowerStore Manager:
+
+. Open *Storage > Volume Groups* on PowerStore A.
+. Locate the volume group whose name starts with the configured `volumeGroupPrefix`.
+. Confirm that all expected volumes are members.
+. Confirm that the volume group has a protection policy with an asynchronous replication rule.
+. Open the replication session and verify:
+** Role is `Source`.
+** Remote system is PowerStore B.
+** RPO is the configured value.
+** State is healthy or synchronized.
+
+If this is the first synchronization, completion can take longer than the configured RPO. Wait for the initial synchronization to finish before evaluating the session against the configured RPO.
+
+Also verify that the corresponding destination volume group exists on PowerStore B and is not writeable while it is secondary.
+
+== Performing DR operations
+
+=== Planned relocation
+
+Use relocation for planned maintenance or workload movement:
+
+[source,shell]
+----
+oc --context <hub-cluster> -n <application-namespace> patch drpc my-app-drpc \
+  --type merge \
+  -p '{"spec":{"action":"Relocate","failoverCluster":"<managed-cluster-b>"}}'
+----
+
+During relocation, OpenShift DR stops the application, performs a final synchronization, makes the source volumes secondary, promotes the target volume group, and starts the application on managed cluster B.
+
+=== Unplanned failover
+
+Use failover only when managed cluster A or PowerStore A is unavailable:
+
+[source,shell]
+----
+oc --context <hub-cluster> -n <application-namespace> patch drpc my-app-drpc \
+  --type merge \
+  -p '{"spec":{"action":"Failover","failoverCluster":"<managed-cluster-b>"}}'
+----
+
+Because this is asynchronous replication, data written after the last successful synchronization can be lost. The maximum expected loss is bounded by, but is not guaranteed to be less than, the configured RPO.
+
+=== Returning to the original cluster
+
+After a failover, use a planned relocation in the opposite direction:
+
+[source,shell]
+----
+oc --context <hub-cluster> -n <application-namespace> patch drpc my-app-drpc \
+  --type merge \
+  -p '{"spec":{"action":"Relocate","failoverCluster":"<managed-cluster-a>"}}'
+----
+
+== Troubleshooting
+
+=== No matching replication class
+
+If the DRPC reports that no `VolumeGroupReplicationClass` is available:
+
+. Confirm the class `provisioner` is exactly `csi-powerstore.dellemc.com`.
+. Confirm `schedulingInterval` exactly matches `DRPolicy.spec.schedulingInterval`.
+. Confirm the storage class and replication class on the same cluster use the same `ramendr.openshift.io/storageid` value.
+. Confirm the peer clusters use the same `groupreplicationid` value.
+. Confirm the storage class has the `ramendr.openshift.io/groupreplicationid` label.
+
+=== VolumeGroupReplication remains secondary or not ready
+
+. Inspect the resource:
++
+[source,shell]
+----
+oc --context <managed-cluster-a> -n <application-namespace> describe vgr <vgr-name>
+oc -n csi-addons-system logs deploy/csi-addons-controller-manager
+----
++
+. Inspect the PowerStore CSI controller logs:
++
+[source,shell]
+----
+oc -n powerstore logs deploy/<powerstore-controller-deployment> -c csi-powerstore
+oc -n powerstore logs deploy/<powerstore-controller-deployment> -c csi-addons
+----
++
+. In PowerStore Manager, verify the remote system, replication session state, and data connection state.
+
+=== Replication parameters are rejected
+
+Common causes are:
+
+* `replicationMode` is not `ASYNC`.
+* `rpo` is `Zero`, which is synchronous-only and unsupported in this preview.
+* `sourceArray` or `targetArray` does not match a global ID in the PowerStore CSI array secret.
+* `remoteSystem` is not the remote-system name configured in PowerStore Manager.
+* The RPO value is not supported by the PowerStore array.
+
+=== Both CSM-DR and CSI-Addons replication are enabled
+
+Set the driver controller environment variables to:
+
+[source,yaml]
+----
+- name: X_CSM_DR_ENABLED
+  value: "false"
+- name: X_CSI_CSIADDONS_REPLICATION_ENABLED
+  value: "true"
+----
+
+Then restart or reconcile the driver deployment. Do not install the Dell CSM replication controller or use `repctl` for this workflow.
+
+== Additional resources
+
+* link:https://docs.redhat.com/en/documentation/red_hat_openshift_data_foundation/4.22/html/configuring_openshift_data_foundation_disaster_recovery_for_openshift_workloads/index/[Red Hat OpenShift Data Foundation 4.22 disaster recovery guide]
+* link:https://dell.github.io/csm-docs/docs/getting-started/installation/openshift/powerstore/csmoperator/[Dell PowerStore CSI Operator installation on OpenShift]
+* link:https://dell.github.io/csm-docs/docs/concepts/replication/[Dell CSM replication concepts]
+* link:https://github.com/csi-addons/kubernetes-csi-addons/blob/main/docs/volumegroupreplicationclass.md[CSI-Addons VolumeGroupReplicationClass]
+* link:https://github.com/ramendr/ramen/blob/main/docs/usage.md[Ramen usage and DR operations]
