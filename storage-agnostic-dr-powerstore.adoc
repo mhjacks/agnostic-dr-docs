@@ -231,6 +231,11 @@ The `VolumeGroupReplicationClass` is cluster-scoped and must be installed on bot
 
 Use a stable value for `ramendr.openshift.io/storageid` that identifies the local storage backend. The array global ID is a good choice. Use the same `groupreplicationid` value on both clusters so Ramen can identify the peer relationship.
 
+[NOTE]
+====
+The `ramendr.openshift.io/replication-class` label is not interpreted by the PowerStore CSI driver. Ramen uses it as the user-defined selector from `DRPolicy.spec.replicationClassSelector` to list candidate `VolumeGroupReplicationClass` resources. The label key and value are arbitrary, but `ramendr.openshift.io/replication-class` is the convention used in Ramen documentation. Keep the label value identical to the value in the DR policy.
+====
+
 === Labeling the PowerStore storage class
 
 Create or update the PowerStore block storage class on both managed clusters. Use the same storage-class name on both clusters, but set each cluster's local storage ID label.
@@ -375,6 +380,8 @@ powerstore-async-vgrc   csi-powerstore.dellemc.com   2m
 
 On the hub cluster, create a `DRPolicy` whose scheduling interval matches the replication class:
 
+You can create and update `DRPolicy` resources from the OpenShift console by using the console's `DRPolicy` custom-resource view, or by applying the YAML shown in this section. The required field values are the same in either method.
+
 [source,yaml]
 ----
 apiVersion: ramendr.openshift.io/v1alpha1
@@ -409,6 +416,8 @@ Wait for a `Validated` condition with status `True`.
 ** Uses a supported PowerStore block volume.
 . Create the DRPC on the hub cluster:
 
+You can create and update DRPC resources from the OpenShift console by using the console's `DRPlacementControl` custom-resource view, or by applying the YAML shown in this section. If you use the console, verify that the resource includes the required `drplacementcontrol.ramendr.openshift.io/resync-on-primary` label.
+
 [source,yaml]
 ----
 apiVersion: ramendr.openshift.io/v1alpha1
@@ -416,6 +425,8 @@ kind: DRPlacementControl
 metadata:
   name: my-app-drpc
   namespace: <application-namespace>
+  labels:
+    drplacementcontrol.ramendr.openshift.io/resync-on-primary: "true"
 spec:
   preferredCluster: <managed-cluster-a>
   drPolicyRef:
@@ -428,6 +439,11 @@ spec:
       app: my-app
   action: Relocate
 ----
+
+[NOTE]
+====
+Set `drplacementcontrol.ramendr.openshift.io/resync-on-primary: "true"` on every DRPC used with PowerStore group replication. This label opts the DRPC into Ramen's resynchronize-on-primary behavior for PowerStore group replication. Do not remove it while the DRPC is in use.
+====
 
 Monitor the DRPC:
 
