@@ -59,6 +59,11 @@ Use one hub cluster and two managed clusters:
       +---------------+         +---------------+
 ....
 
+[NOTE]
+====
+In this Technology Preview, the console UI topology tab does not show PowerStore clusters or their replication relationships, even when the PowerStore arrays and group replication are correctly configured. Use the verification commands in this guide and PowerStore Manager to validate the storage topology.
+====
+
 === What OpenShift DR creates
 
 Do not create `VolumeGroupReplication` or `VolumeGroupReplicationContent` resources manually. After you create a `DRPlacementControl`, Ramen:
