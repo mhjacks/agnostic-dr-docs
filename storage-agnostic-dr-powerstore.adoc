@@ -326,6 +326,44 @@ Keep the class name, `groupreplicationid`, `schedulingInterval`, RPO, and mode t
 `VolumeGroupReplicationClass.spec.provisioner` and `.spec.parameters` are immutable. To change the RPO, remote system, or scheduling interval, create a new class and update the storage-class labels and DR policy as needed.
 ====
 
+=== Restricting restored volumes to accessible nodes
+
+`ramendr.openshift.io/accessibleTopology` is an optional `VolumeGroupReplicationClass.spec.parameters` key. Despite its `ramendr.openshift.io` name, it is not a Kubernetes label and must not be added to `metadata.labels`.
+
+When Ramen restores a PersistentVolume (PV) from an S3 store during asynchronous DR, it reads this parameter from the replication class that matches the PV storage class, provisioner, storage ID, and scheduling interval. If the parameter is present, Ramen replaces the restored PV's existing required node affinity with a node selector derived from the parameter. This ensures that a restored PV can be used only by pods on nodes that can access the local storage topology.
+
+The value must be a JSON array of objects. Each key and value pair is a node label and a required value. Within one object, multiple pairs are combined with a logical `AND`; multiple objects are combined with a logical `OR`. Use node labels that identify where workloads can access the local PowerStore storage, such as the standard topology zone label.
+
+For example, on managed cluster A, allow restored volumes on nodes in `powerstore-zone-a` or `powerstore-zone-b`:
+
+[source,yaml]
+----
+apiVersion: replication.storage.openshift.io/v1alpha1
+kind: VolumeGroupReplicationClass
+metadata:
+  name: powerstore-async-vgrc
+spec:
+  provisioner: csi-powerstore.dellemc.com
+  parameters:
+    schedulingInterval: 5m
+    ramendr.openshift.io/accessibleTopology: '[{"topology.kubernetes.io/zone":"powerstore-zone-a"},{"topology.kubernetes.io/zone":"powerstore-zone-b"}]'
+    # Other PowerStore parameters are omitted from this example.
+----
+
+On managed cluster B, use the zones that can access cluster B's local PowerStore array. Set the value independently on each cluster.
+
+Verify the parameter on each cluster:
+
+[source,shell]
+----
+oc --context <managed-cluster-a> get volumegroupreplicationclass powerstore-async-vgrc \
+  -o jsonpath='{.spec.parameters.ramendr\.openshift\.io/accessibleTopology}{"\n"}'
+oc --context <managed-cluster-b> get volumegroupreplicationclass powerstore-async-vgrc \
+  -o jsonpath='{.spec.parameters.ramendr\.openshift\.io/accessibleTopology}{"\n"}'
+----
+
+The parameter is optional. If it is absent, its value is an empty array, or every object in the array is empty, Ramen leaves the restored PV's existing node affinity unchanged. An invalid value, including `null` or a JSON object instead of an array, causes the PV restore to fail. Because replication-class parameters are immutable, correct an invalid or outdated topology value by creating a new `VolumeGroupReplicationClass` and updating the storage-class labels and DR policy as needed.
+
 === Applying the class
 
 Save the manifests as, for example, `cluster-a-vgrc.yaml` and `cluster-b-vgrc.yaml`, and apply them:
@@ -361,6 +399,9 @@ powerstore-async-vgrc   csi-powerstore.dellemc.com   2m
 
 |`schedulingInterval`
 |Must exactly match `DRPolicy.spec.schedulingInterval`. Ramen uses this value to select a matching class. The examples use `5m`.
+
+|`ramendr.openshift.io/accessibleTopology`
+|Optional JSON array of node-label segments used during PV restore to set the restored PV's required node affinity. Segments are ORed; key-value pairs within a segment are ANDed.
 
 |`replication.storage.dell.com/replicationMode`
 |Must be `ASYNC` in this Technology Preview.
