@@ -165,6 +165,22 @@ Install the ODF CSI-Addons operator on both managed clusters by using the suppor
 The `openshift-storage` namespace is required by the operator. Creating the subscription does not install an ODF `StorageCluster` or the ODF storage stack.
 ====
 
+In the web console, the operator is listed in the *Red Hat Operators* catalog source in OperatorHub under the name *CSI Addons*. The package name in the subscription is `odf-csi-addons-operator`.
+
+To install the operator from the web console:
+
+. Log in to the OpenShift console of managed cluster A, and navigate to *Operators > OperatorHub*.
+. In the *Filter by keyword* field, enter `CSI Addons`.
+. Click the *CSI Addons* tile, and then click *Install*.
+. On the *Install Operator* page, set the following options:
+** *Update channel:* `stable-4.22`
+** *Installation mode:* *A specific namespace on the cluster*, and select `openshift-storage` as the installed namespace
+** *Update approval:* *Automatic*
+. Click *Install*, and wait for the *CSI Addons* operator to show status *Succeeded* on the *Installed Operators* page in the `openshift-storage` project.
+. Repeat these steps on managed cluster B.
+
+To install the operator from the CLI, apply the following subscription:
+
 [source,yaml]
 ----
 apiVersion: operators.coreos.com/v1alpha1
@@ -218,7 +234,22 @@ On the cluster where the DRPC is created, first determine whether Recipe is alre
 oc -n openshift-storage get csv
 ----
 
-If the output already contains a `recipe.v4.22.*-rhodf` CSV, do not create another Recipe subscription. If Recipe is absent, install the 4.22 operator from `redhat-operators`:
+If the output already contains a `recipe.v4.22.*-rhodf` CSV, do not create another Recipe subscription. If Recipe is absent, install the 4.22 operator from `redhat-operators`.
+
+In the web console, Recipe is listed in the *Red Hat Operators* catalog source in OperatorHub under the name *Recipe*. The package name in the subscription is `recipe`.
+
+To install Recipe from the web console:
+
+. In the OpenShift console of the cluster where the DRPC is created, navigate to *Operators > OperatorHub*.
+. In the *Filter by keyword* field, enter `Recipe`.
+. Click the *Recipe* tile, and then click *Install*.
+. On the *Install Operator* page, set the following options:
+** *Update channel:* `stable-4.22`
+** *Installation mode:* *A specific namespace on the cluster*, and select `openshift-storage` as the installed namespace
+** *Update approval:* *Automatic*
+. Click *Install*, and wait for the *Recipe* operator to show status *Succeeded* on the *Installed Operators* page in the `openshift-storage` project.
+
+To install Recipe from the CLI, apply the following subscription:
 
 [source,yaml]
 ----
