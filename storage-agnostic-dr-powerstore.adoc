@@ -207,9 +207,54 @@ oc --context <managed-cluster-b> get crd \
 Do not install the upstream `kubernetes-csi-addons` manifests directly. Use the ODF CSI-Addons operator subscription shown above.
 ====
 
+== Installing Recipe for Kubernetes object protection
+
+Install Recipe only if your DRPC uses `spec.kubeObjectProtection` and refers to a `Recipe` custom resource. Recipe is optional for DR configurations that protect only PersistentVolumeClaims.
+
+On the cluster where the DRPC is created, first determine whether Recipe is already installed:
+
+[source,shell]
+----
+oc -n openshift-storage get csv
+----
+
+If the output already contains a `recipe.v4.22.*-rhodf` CSV, do not create another Recipe subscription. If Recipe is absent, install the 4.22 operator from `redhat-operators`:
+
+[source,yaml]
+----
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: recipe
+  namespace: openshift-storage
+spec:
+  channel: stable-4.22
+  installPlanApproval: Automatic
+  name: recipe
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  startingCSV: recipe.v4.22.9-rhodf
+----
+
+Verify the installation:
+
+[source,shell]
+----
+oc -n openshift-storage get subscription recipe
+oc -n openshift-storage get csv recipe.v4.22.9-rhodf
+oc get crd recipes.ramendr.openshift.io
+----
+
+[NOTE]
+====
+Some ODF installations create the Recipe subscription automatically as an ODF dependency. In that case, use the existing subscription and CSV instead of installing a second copy.
+====
+
 == Creating and installing the VolumeGroupReplicationClass
 
 The `VolumeGroupReplicationClass` is cluster-scoped and must be installed on both managed clusters. Use the same class name and group replication ID on both clusters, but reverse the local and remote PowerStore values.
+
+Set the `ramendr.openshift.io/resync-on-primary: "true"` label on every `VolumeGroupReplicationClass` used for PowerStore group replication. The label is required for Ramen's resynchronize-on-primary behavior. Do not set the corresponding label on `DRPlacementControl`.
 
 === Values used in the examples
 
@@ -296,6 +341,7 @@ metadata:
   name: powerstore-async-vgrc
   labels:
     ramendr.openshift.io/replication-class: powerstore-async
+    ramendr.openshift.io/resync-on-primary: "true"
     ramendr.openshift.io/storageid: powerstore-a
     ramendr.openshift.io/groupreplicationid: powerstore-async
   annotations:
@@ -319,7 +365,7 @@ On managed cluster B, create the same object with these changes:
 * `replication.storage.dell.com/targetArray: <powerstore-a-global-id>`
 * `replication.storage.dell.com/remoteSystem: <powerstore-a-name>`
 
-Keep the class name, `groupreplicationid`, `schedulingInterval`, RPO, and mode the same.
+Keep the class name, `groupreplicationid`, `resync-on-primary`, `schedulingInterval`, RPO, and mode the same.
 
 [NOTE]
 ====
@@ -462,7 +508,7 @@ Wait for a `Validated` condition with status `True`.
 ** Uses a supported PowerStore block volume.
 . Create the DRPC on the hub cluster:
 
-You can create and update DRPC resources from the OpenShift console by using the console's `DRPlacementControl` custom-resource view, or by applying the YAML shown in this section. If you use the console, verify that the resource includes the required `drplacementcontrol.ramendr.openshift.io/resync-on-primary` label.
+You can create and update DRPC resources from the OpenShift console by using the console's `DRPlacementControl` custom-resource view, or by applying the YAML shown in this section.
 
 [source,yaml]
 ----
@@ -471,8 +517,6 @@ kind: DRPlacementControl
 metadata:
   name: my-app-drpc
   namespace: <application-namespace>
-  labels:
-    drplacementcontrol.ramendr.openshift.io/resync-on-primary: "true"
 spec:
   preferredCluster: <managed-cluster-a>
   drPolicyRef:
@@ -488,7 +532,7 @@ spec:
 
 [NOTE]
 ====
-Set `drplacementcontrol.ramendr.openshift.io/resync-on-primary: "true"` on every DRPC used with PowerStore group replication. This label opts the DRPC into Ramen's resynchronize-on-primary behavior for PowerStore group replication. Do not remove it while the DRPC is in use.
+Do not add a `resync-on-primary` label to the DRPC. The required label is `ramendr.openshift.io/resync-on-primary: "true"` on the `VolumeGroupReplicationClass`, as shown earlier in this document.
 ====
 
 Monitor the DRPC:
