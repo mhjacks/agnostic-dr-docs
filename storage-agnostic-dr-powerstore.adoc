@@ -281,6 +281,107 @@ oc get crd recipes.ramendr.openshift.io
 Some ODF installations create the Recipe subscription automatically as an ODF dependency. In that case, use the existing subscription and CSV instead of installing a second copy.
 ====
 
+== Installing OADP for application backup and restore
+
+Install the OpenShift API for Data Protection (OADP) operator only if you also want Velero-based application backup and restore on the managed clusters. OADP is not installed by the ODF Multicluster Orchestrator operator that provides the ODF DR orchestrator, and it is not required by the DR workflows in this guide:
+
+* Persistent data protection uses the CSI-Addons `VolumeGroupReplication` APIs.
+* Kubernetes object protection, when the DRPC uses `spec.kubeObjectProtection`, is provided by Recipe, as described earlier in this document.
+
+The Red Hat DR guide also requires OADP and a `DataProtectionApplication` resource on the managed clusters when protecting discovered applications, which are applications that are not deployed through an RHACM Placement or a GitOps ApplicationSet. That flow is not covered in this guide.
+
+Installing the operator does not deploy Velero. Velero is deployed when you create a `DataProtectionApplication` custom resource in the `openshift-adp` namespace. For the supported backup storage providers and the `DataProtectionApplication` configuration reference, see the OADP documentation listed in the "Additional resources" section.
+
+On each managed cluster, first determine whether OADP is already installed:
+
+[source,shell]
+----
+oc --context <managed-cluster-a> -n openshift-adp get csv
+oc --context <managed-cluster-b> -n openshift-adp get csv
+----
+
+If the `openshift-adp` namespace does not exist, or if the output does not contain an `oadp-operator` CSV, install the operator as described in this section. If OADP is already installed, use the existing subscription and CSV instead of installing a second copy.
+
+In the web console, the operator is listed in the *Red Hat Operators* catalog source in OperatorHub under the name *OADP Operator*. The package name in the subscription is `redhat-oadp-operator`.
+
+To install the operator from the web console:
+
+. Log in to the OpenShift console of managed cluster A, and navigate to *Operators > OperatorHub*.
+. In the *Filter by keyword* field, enter `OADP`.
+. Click the *OADP Operator* tile, and then click *Install*.
+. On the *Install Operator* page, set the following options:
+** *Update channel:* `stable`
+** *Installation mode:* *A specific namespace on the cluster*, and select `openshift-adp` as the installed namespace
+** *Update approval:* *Automatic*
+. Click *Install*, and wait for the *OADP Operator* to show status *Succeeded* on the *Installed Operators* page in the `openshift-adp` project.
+. Repeat these steps on managed cluster B.
+
+To install the operator from the CLI, create the namespace, the operator group, and the subscription:
+
+[source,yaml]
+----
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-adp
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: oadp-operator-group
+  namespace: openshift-adp
+spec:
+  targetNamespaces:
+    - openshift-adp
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: redhat-oadp-operator
+  namespace: openshift-adp
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: redhat-oadp-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  startingCSV: oadp-operator.v1.6.2
+----
+
+Apply these resources on managed cluster A and managed cluster B.
+
+[NOTE]
+====
+The `stable` channel contains the OADP version that is supported for the OpenShift version of the cluster. On OpenShift Container Platform 4.22, this is OADP 1.6, which deploys Velero 1.18 when the `DataProtectionApplication` resource is created. To remain on a specific OADP minor version, use the `stable-1.6` channel instead of `stable`.
+====
+
+Verify the installation:
+
+[source,shell]
+----
+oc --context <managed-cluster-a> -n openshift-adp get subscription redhat-oadp-operator
+oc --context <managed-cluster-b> -n openshift-adp get subscription redhat-oadp-operator
+
+oc --context <managed-cluster-a> -n openshift-adp get csv | grep oadp
+oc --context <managed-cluster-b> -n openshift-adp get csv | grep oadp
+
+oc --context <managed-cluster-a> -n openshift-adp get pods
+oc --context <managed-cluster-b> -n openshift-adp get pods
+----
+
+The `openshift-adp-controller-manager` pod must be running on both clusters. The `velero` pod is created only after you create a `DataProtectionApplication` resource.
+
+[IMPORTANT]
+====
+If you install OADP after the DR policy and DRPlacementControl resources already exist, restart the DR cluster operator on both managed clusters so that it detects the OADP installation:
+
+[source,shell]
+----
+oc --context <managed-cluster-a> -n openshift-dr-system rollout restart deployment/ramen-dr-cluster-operator
+oc --context <managed-cluster-b> -n openshift-dr-system rollout restart deployment/ramen-dr-cluster-operator
+----
+====
+
 == Creating and installing the VolumeGroupReplicationClass
 
 The `VolumeGroupReplicationClass` is cluster-scoped and must be installed on both managed clusters. Use the same class name and group replication ID on both clusters, but reverse the local and remote PowerStore values.
@@ -888,6 +989,7 @@ Then restart or reconcile the driver deployment. Do not install the Dell CSM rep
 == Additional resources
 
 * link:https://docs.redhat.com/en/documentation/red_hat_openshift_data_foundation/4.22/html/configuring_openshift_data_foundation_disaster_recovery_for_openshift_workloads/index/[Red Hat OpenShift Data Foundation 4.22 disaster recovery guide]
+* link:https://docs.redhat.com/en/documentation/openshift_container_platform/4.22/html/backup_and_restore/oadp-application-backup-and-restore/[OpenShift API for Data Protection application backup and restore]
 * link:https://dell.github.io/csm-docs/docs/getting-started/installation/openshift/powerstore/csmoperator/[Dell PowerStore CSI Operator installation on OpenShift]
 * link:https://dell.github.io/csm-docs/docs/concepts/replication/[Dell CSM replication concepts]
 * link:https://github.com/csi-addons/kubernetes-csi-addons/blob/main/docs/volumegroupreplicationclass.md[CSI-Addons VolumeGroupReplicationClass]
