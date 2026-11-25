@@ -227,7 +227,7 @@ Do not install the upstream `kubernetes-csi-addons` manifests directly. Use the 
 
 Install Recipe only if your DRPC uses `spec.kubeObjectProtection` and refers to a `Recipe` custom resource. Recipe is optional for DR configurations that protect only PersistentVolumeClaims.
 
-On the cluster where the DRPC is created, first determine whether Recipe is already installed:
+On the clusters that the DRPC will manage, first determine whether Recipe is already installed:
 
 [source,shell]
 ----
