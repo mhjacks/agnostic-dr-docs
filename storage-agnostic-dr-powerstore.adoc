@@ -86,7 +86,7 @@ You are responsible for creating and labeling the storage class and the replicat
 * Verify that the PowerStore management and replication networks are healthy and that the remote-system data connection state is `Complete`.
 * Verify that all worker nodes that run protected workloads have the required PowerStore FC, iSCSI, or NVMe/TCP connectivity.
 * Plan an asynchronous RPO. This guide uses a five-minute RPO.
-* Provide an S3-compatible object store for Ramen metadata, and configure the required S3 profile. See the Red Hat DR guide for the object-store and GitOps setup.
+* Provide an S3-compatible object store for Ramen metadata, and configure the required S3 profiles. See xref:s3-profiles[Configuring S3 profiles for user-provided S3 storage]. For the GitOps setup, see the Red Hat DR guide.
 
 [IMPORTANT]
 ====
@@ -499,6 +499,190 @@ powerstore-async-vgrc   csi-powerstore.dellemc.com   2m
 |Optional prefix for PowerStore volume-group names. The default driver prefix is `vg`.
 |===
 
+[[s3-profiles]]
+== Configuring S3 profiles for user-provided S3 storage
+
+OpenShift DR stores PersistentVolume (PV) metadata and other cluster data in an S3-compatible object store, and uses that data to recover protected applications on the peer cluster. Storage-agnostic DR does not include the OpenShift Data Foundation storage stack or a Multicloud Object Gateway (MCG), so you must provide your own object storage and configure an S3 profile for each managed cluster.
+
+The object store must meet the following requirements:
+
+* It must be S3-compatible and reachable over HTTPS from the hub cluster and from both managed clusters.
+* It must provide a separate bucket for each managed cluster. Ramen stores the data that is required to recover an application on a managed cluster in the S3 profile of that cluster, and uploads data from active applications to the S3 profiles of the peer clusters in the same DR policy.
+* You must be able to create access credentials, an access key ID and a secret access key, for each bucket.
+* You must provide an S3 region for each profile. The region is required even if your object store does not use regions.
+
+[IMPORTANT]
+====
+MinIO is not recommended or supported for production deployments. Use MinIO only for evaluation and test environments. For production, use a supported, production-grade, S3-compatible object store, such as Amazon Web Services S3 or a Red Hat Ceph Storage RADOS Gateway.
+====
+
+[NOTE]
+====
+A bucket can be shared by multiple DR-protected applications in the same hub cluster. Do not use the same bucket for more than one hub cluster, because concurrent uploads from multiple hubs can conflict and corrupt the stored data.
+====
+
+=== Creating the S3 credential secrets
+
+On the hub cluster, create a secret for each bucket in the namespace where the DR hub operator runs. With the default ODF DR orchestrator installation, this is the `openshift-operators` namespace. Each secret must contain the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` keys:
+
+[source,shell]
+----
+oc --context <hub-cluster> -n openshift-operators create secret generic ramen-s3-secret-<managed-cluster-a> \
+  --from-literal=AWS_ACCESS_KEY_ID=<access-key-id> \
+  --from-literal=AWS_SECRET_ACCESS_KEY=<secret-access-key>
+
+oc --context <hub-cluster> -n openshift-operators create secret generic ramen-s3-secret-<managed-cluster-b> \
+  --from-literal=AWS_ACCESS_KEY_ID=<access-key-id> \
+  --from-literal=AWS_SECRET_ACCESS_KEY=<secret-access-key>
+----
+
+[NOTE]
+====
+If both buckets use the same credentials, you can create one secret and reference it from both S3 profiles.
+====
+
+=== Adding the S3 profiles to the DR hub operator configuration
+
+S3 profiles are configured in the `ramen-hub-operator-config` ConfigMap on the hub cluster:
+
+[source,shell]
+----
+oc --context <hub-cluster> edit configmap ramen-hub-operator-config -n openshift-operators
+----
+
+Add a `s3StoreProfiles` entry for each managed cluster under the `ramen_manager_config.yaml` key:
+
+[source,yaml]
+----
+[...]
+data:
+  ramen_manager_config.yaml: |
+    apiVersion: ramendr.openshift.io/v1alpha1
+    kind: RamenConfig
+    # [...]
+    s3StoreProfiles:
+    - s3ProfileName: s3profile-<managed-cluster-a>
+      s3Bucket: <s3-bucket-a>
+      s3CompatibleEndpoint: https://<s3-endpoint>
+      s3Region: <s3-region>
+      s3SecretRef:
+        name: ramen-s3-secret-<managed-cluster-a>
+    - s3ProfileName: s3profile-<managed-cluster-b>
+      s3Bucket: <s3-bucket-b>
+      s3CompatibleEndpoint: https://<s3-endpoint>
+      s3Region: <s3-region>
+      s3SecretRef:
+        name: ramen-s3-secret-<managed-cluster-b>
+----
+
+The two buckets can be on the same object-store endpoint or on different endpoints.
+
+[NOTE]
+====
+Do not set a namespace in `s3SecretRef`. Ramen resolves the secret in the namespace of the DR hub operator on the hub cluster, and in `openshift-dr-system` on the managed clusters. When the DR policy is created, the DR hub operator copies the credentials to the managed clusters automatically.
+====
+
+Restart the DR hub operator to apply the configuration change:
+
+[source,shell]
+----
+oc --context <hub-cluster> -n openshift-operators rollout restart deployment/ramen-hub-operator
+----
+
+[NOTE]
+====
+This guide assumes the default ODF installation, where the DR orchestrator and the DR hub operator run in the `openshift-operators` namespace on the hub cluster. If you installed the DR hub operator in a different namespace, use that namespace for the ConfigMap, the secrets, and the restart command.
+====
+
+=== S3 profile field reference
+
+[cols="2,3"]
+|===
+|Field |Description
+
+|`s3ProfileName`
+|Unique name of the S3 profile. Referenced by `DRCluster.spec.s3ProfileName`.
+
+|`s3Bucket`
+|Bucket that stores the cluster data for the managed cluster. The name must follow AWS bucket naming rules.
+
+|`s3CompatibleEndpoint`
+|Endpoint of the object store. If the scheme is omitted, `https://` is assumed. An `http://` endpoint is insecure and is intended for testing only.
+
+|`s3Region`
+|Region that the S3 client uses for request signing. Required even for object stores that do not use regions. For such stores, use the region configured on the store or a placeholder value such as `us-east-1`.
+
+|`s3SecretRef.name`
+|Name of the credential secret that you created on the hub cluster. Do not set the namespace.
+
+|`caCertificates`
+|Optional base64-encoded CA bundle. Add it when the object store uses a certificate that is signed by a private CA.
+|===
+
+=== Creating the DRCluster resources
+
+Each managed cluster that participates in a DR policy requires a `DRCluster` resource on the hub cluster that refers to its S3 profile. Save the following resources as, for example, `drclusters.yaml`:
+
+[source,yaml]
+----
+apiVersion: ramendr.openshift.io/v1alpha1
+kind: DRCluster
+metadata:
+  name: <managed-cluster-a>
+spec:
+  s3ProfileName: s3profile-<managed-cluster-a>
+---
+apiVersion: ramendr.openshift.io/v1alpha1
+kind: DRCluster
+metadata:
+  name: <managed-cluster-b>
+spec:
+  s3ProfileName: s3profile-<managed-cluster-b>
+----
+
+The name of each `DRCluster` must match the name of the managed cluster as it is enrolled with RHACM.
+
+Apply the resources:
+
+[source,shell]
+----
+oc --context <hub-cluster> apply -f drclusters.yaml
+----
+
+[IMPORTANT]
+====
+`DRCluster.spec.s3ProfileName` is immutable. To change the S3 profile of a managed cluster, first delete the `DRPlacementControl` resources and the DR policy, then delete and recreate the `DRCluster` resource with the new profile.
+====
+
+=== Verifying the S3 profile configuration
+
+Wait for each `DRCluster` to be validated:
+
+[source,shell]
+----
+oc --context <hub-cluster> get drclusters
+
+oc --context <hub-cluster> describe drcluster <managed-cluster-a>
+oc --context <hub-cluster> describe drcluster <managed-cluster-b>
+----
+
+Each `DRCluster` must reach phase `Available` with a `Validated` condition of status `True`. During validation, the DR hub operator connects to the object store and lists the bucket contents. If validation fails, inspect the `Validated` condition for one of the following reasons:
+
+* `s3ConnectionFailed`: the S3 endpoint is unreachable from the hub cluster.
+* `s3ListFailed`: the credentials are invalid, or the bucket does not exist.
+* `ConfigMapGetFailed`: the `ramen-hub-operator-config` ConfigMap could not be read.
+
+The DR hub operator deploys the DR cluster components to each managed cluster and, when the DR policy is created, copies the S3 credentials to the `openshift-dr-system` namespace on each managed cluster. After the DR policy is created and validates, confirm that the profiles and credentials were distributed to the managed clusters:
+
+[source,shell]
+----
+oc --context <managed-cluster-a> -n openshift-dr-system get configmap ramen-dr-cluster-operator-config \
+  -o yaml | grep -A 14 s3StoreProfiles
+
+oc --context <managed-cluster-a> -n openshift-dr-system get secrets
+oc --context <managed-cluster-b> -n openshift-dr-system get secrets
+----
+
 == Creating a DR policy
 
 On the hub cluster, create a `DRPolicy` whose scheduling interval matches the replication class:
@@ -708,3 +892,4 @@ Then restart or reconcile the driver deployment. Do not install the Dell CSM rep
 * link:https://dell.github.io/csm-docs/docs/concepts/replication/[Dell CSM replication concepts]
 * link:https://github.com/csi-addons/kubernetes-csi-addons/blob/main/docs/volumegroupreplicationclass.md[CSI-Addons VolumeGroupReplicationClass]
 * link:https://github.com/ramendr/ramen/blob/main/docs/usage.md[Ramen usage and DR operations]
+* link:https://github.com/ramendr/ramen/blob/main/docs/configure.md[Ramen S3 profile and DRCluster configuration]
